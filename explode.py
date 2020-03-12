@@ -111,7 +111,17 @@ ch_code_asc = [
 ]
 
 
-class TDcmpStruct:
+def _gen_decode_tabs(positions, start_indexes, length_bits):
+    assert (len(length_bits) == len(start_indexes))
+    for i in range(len(length_bits)):
+        length = 1 << length_bits[i]  # Get the length in bytes
+        index = start_indexes[i]
+        while index < 0x100:
+            positions[index] = i & 0xFF
+            index += length
+
+
+class PkDecompressor:
 
     def __init__(self, input_buffer):
         self.offs0000 = 0  # 0000
@@ -127,7 +137,11 @@ class TDcmpStruct:
         #        0x0000 - 0x0FFF: Previous uncompressed data, kept for repetitions
         #        0x1000 - 0x1FFF: Currently decompressed data
         #        0x2000 - 0x2203: Reserve space for the longest possible repetition
-        self.in_buff = bytearray(0x800)  # 2234: Buffer for data to be decompressed
+        self.in_buff = input_buffer  # bytearray(0x800)  # 2234: Buffer for data to be decompressed
+        self.in_bytes = len(input_buffer)
+        if self.in_bytes <= 4:
+            raise Exception("CMP_BAD_DATA")
+
         self.dist_pos_codes = bytearray(0x100)  # 2A34: Table of distance position codes
         self.length_codes = bytearray(0x100)  # 2B34: Table of length codes
         self.offs2C34 = bytearray(0x100)  # 2C34: Buffer for
@@ -139,347 +153,299 @@ class TDcmpStruct:
         self.len_bits = bytearray(0x10)  # 30F4: Numbers of bits for skip copied block length
         self.ex_len_bits = bytearray(0x10)  # 3104: Number of valid bits for copied block
         self.len_base = [0] * 0x10  # 3114: Buffer for
-
-        self.compressed = input_buffer  # 0024: Custom parameter
-        self.compressed_offset = 0
         self.decompressed = bytearray()
 
-    def read_buf(self, size):
-        n_max_avail = (len(self.compressed) - self.compressed_offset) & 0xFFFFFFFF
-        n_to_read = size
+        #  Initialize work struct and load compressed data
+        #  Note: The caller must zero the "work_buff" before passing it to explode
+        self.in_pos = len(self.in_buff)
+        self.ctype = self.in_buff[0]  # Get the compression type (CMP_BINARY or CMP_ASCII)
+        self.dsize_bits = self.in_buff[1]  # Get the dictionary size
+        self.bit_buff = self.in_buff[2]  # Initialize 16-bit bit buffer
+        self.extra_bits = 0  # Extra (over 8) bits
+        self.in_pos = 3  # Position in input buffer
 
-        # Check the case when not enough data available
-        if n_to_read > n_max_avail:
-            n_to_read = n_max_avail
+        #  Test for the valid dictionary size
+        if 4 > self.dsize_bits or self.dsize_bits > 6:
+            raise Exception("CMP_INVALID_DICTSIZE")
 
-        # Load data and increment offsets
-        ret = self.compressed[self.compressed_offset:self.compressed_offset + n_to_read]
-        self.compressed_offset += n_to_read
-        assert (self.compressed_offset <= len(self.compressed))
-        return ret
+        self.dsize_mask = 0xFFFF >> (0x10 - self.dsize_bits)  # Shifted by 'sar' instruction
 
-    def write_buf(self, buf):
-        self.decompressed += buf
+        if self.ctype != CMP_BINARY:
+            if self.ctype != CMP_ASCII:
+                raise Exception("CMP_INVALID_MODE")
 
+            self.ch_bits_asc[:len(self.ch_bits_asc)] = ch_bits_asc
+            self._gen_asc_tabs()
 
-def gen_decode_tabs(positions, start_indexes, length_bits):
-    assert (len(length_bits) == len(start_indexes))
-    for i in range(len(length_bits)):
-        length = 1 << length_bits[i]  # Get the length in bytes
-        index = start_indexes[i]
-        while index < 0x100:
-            positions[index] = i & 0xFF
-            index += length
+        self.len_bits[:len(self.len_bits)] = len_bits
+        _gen_decode_tabs(self.length_codes, len_code, self.len_bits, )
+        self.ex_len_bits[:len(self.ex_len_bits)] = ex_len_bits
+        self.len_base[:len(self.len_base)] = len_base
+        self.dist_bits[:len(self.dist_bits)] = dist_bits
+        _gen_decode_tabs(self.dist_pos_codes, dist_code, self.dist_bits)
 
+    def expand(self):
+        self.output_pos = 0x1000  # Initialize output buffer position
 
-def gen_asc_tabs(work):
-    pch_code_asc_idx = 0xFF
-    count = 0x00FF
+        #  Decode the next literal from the input data.
+        #  The returned literal can either be an uncompressed byte (next_literal < 0x100)
+        #  or an encoded length of the repeating byte sequence that
+        #  is to be copied to the current buffer position
+        result = next_literal = self._decode_lit()
 
-    while pch_code_asc_idx >= 0:
-        pch_bits_asc_idx = count
-        bits_asc = work.ch_bits_asc[pch_bits_asc_idx]
+        while result < 0x305:
+            #  If the literal is greater than 0x100, it holds length
+            #  of repeating byte sequence
+            #  literal of 0x100 means repeating sequence of 0x2 bytes
+            #  literal of 0x101 means repeating sequence of 0x3 bytes
+            #  ...
+            #  literal of 0x305 means repeating sequence of 0x207 bytes
+            if next_literal >= 0x100:
+                #  Get the length of the repeating sequence.
+                #  Note that the repeating block may overlap the current output position,
+                #  for example if there was a sequence of equal bytes
+                rep_length = next_literal - 0xFE
 
-        if bits_asc <= 8:
-            add = (1 << bits_asc)
-            acc = ch_code_asc[pch_code_asc_idx]
-
-            while True:
-                work.offs2C34[acc] = count & 0xFF
-                acc += add
-                if acc >= 0x100:
+                #  Get backward distance to the repetition
+                minus_dist = self._decode_dist(rep_length)
+                if minus_dist == 0:
+                    result = 0x306
                     break
 
-        else:
-            acc = (ch_code_asc[pch_code_asc_idx] & 0xFF)
-            if acc != 0:
-                work.offs2C34[acc] = 0xFF
+                #  Target and source pointer
+                target_offset = self.output_pos
+                source_offset = self.output_pos - minus_dist
 
-                if ch_code_asc[pch_code_asc_idx] & 0x3F:
-                    bits_asc -= 4
-                    work.ch_bits_asc[pch_bits_asc_idx] = bits_asc
+                #  Copy the repeating sequence
+                self.out_buff[target_offset:target_offset + rep_length] = \
+                    self.out_buff[source_offset:source_offset + rep_length]
 
-                    add = (1 << bits_asc)
-                    acc = ch_code_asc[pch_code_asc_idx] >> 4
-
-                    while True:
-                        work.offs2D34[acc] = count & 0xFF
-                        acc += add
-                        if acc >= 0x100:
-                            break
-                else:
-                    bits_asc -= 6
-                    work.ch_bits_asc[pch_bits_asc_idx] = bits_asc
-
-                    add = (1 << bits_asc)
-                    acc = ch_code_asc[pch_code_asc_idx]
-
-                    while True:
-                        work.offs2E34[acc] = count & 0xFF
-                        acc += add
-                        if acc >= 0x80:
-                            break
+                #  Update buffer output position
+                self.output_pos += rep_length
 
             else:
-                bits_asc -= 8
-                work.ch_bits_asc[pch_bits_asc_idx] = bits_asc
+                self.output_pos += 1
+                self.out_buff[self.output_pos - 1] = next_literal & 0xFF
 
+            #  Flush the output buffer, if number of extracted bytes has reached the end
+            if self.output_pos >= 0x2000:
+                #  Copy decompressed data into user buffer
+                copy_bytes = 0x1000
+                self.decompressed += self.out_buff[0x1000:0x1000 + copy_bytes]
+
+                #  Now copy the decompressed data to the first half of the buffer.
+                #  This is needed because the decompression might reuse them as repetitions.
+                #  Note that if the output buffer overflowed previously, the extra decompressed bytes
+                #  are stored in "out_buff_overflow", and they will now be
+                #  within decompressed part of the output buffer.
+                target_offset = 0
+                source_offset = 0x1000
+                copy_length = self.output_pos - 0x1000
+
+                self.out_buff[target_offset:target_offset + copy_length] = \
+                    self.out_buff[source_offset:source_offset + copy_length]
+
+                self.output_pos -= 0x1000
+
+            result = next_literal = self._decode_lit()
+
+        #  Flush any remaining decompressed bytes
+        copy_bytes = self.output_pos - 0x1000
+        self.decompressed += self.out_buff[0x1000:0x1000 + copy_bytes]
+
+        if result != 0x306:
+            return self.decompressed
+        raise Exception("CMP_ABORT")
+
+    def _gen_asc_tabs(self):
+        pch_code_asc_idx = 0xFF
+        count = 0x00FF
+
+        while pch_code_asc_idx >= 0:
+            pch_bits_asc_idx = count
+            bits_asc = self.ch_bits_asc[pch_bits_asc_idx]
+
+            if bits_asc <= 8:
                 add = (1 << bits_asc)
-                acc = ch_code_asc[pch_code_asc_idx] >> 8
+                acc = ch_code_asc[pch_code_asc_idx]
 
                 while True:
-                    work.offs2EB4[acc] = count & 0xFF
+                    self.offs2C34[acc] = count & 0xFF
                     acc += add
                     if acc >= 0x100:
                         break
 
-        pch_code_asc_idx -= 1
-        count -= 1
+            else:
+                acc = (ch_code_asc[pch_code_asc_idx] & 0xFF)
+                if acc != 0:
+                    self.offs2C34[acc] = 0xFF
 
+                    if ch_code_asc[pch_code_asc_idx] & 0x3F:
+                        bits_asc -= 4
+                        self.ch_bits_asc[pch_bits_asc_idx] = bits_asc
 
-# -----------------------------------------------------------------------------
-#  Removes given number of bits in the bit buffer. New bits are reloaded from
-#  the input buffer, if needed.
-#  Returns: PKDCL_OK:         Operation was successful
-#           PKDCL_STREAM_END: There are no more bits in the input buffer
-def waste_bits(work, n_bits):
-    #  If number of bits required is less than number of (bits in the buffer) ?
-    if n_bits <= work.extra_bits:
-        work.extra_bits -= n_bits
-        work.bit_buff >>= n_bits
+                        add = (1 << bits_asc)
+                        acc = ch_code_asc[pch_code_asc_idx] >> 4
+
+                        while True:
+                            self.offs2D34[acc] = count & 0xFF
+                            acc += add
+                            if acc >= 0x100:
+                                break
+                    else:
+                        bits_asc -= 6
+                        self.ch_bits_asc[pch_bits_asc_idx] = bits_asc
+
+                        add = (1 << bits_asc)
+                        acc = ch_code_asc[pch_code_asc_idx]
+
+                        while True:
+                            self.offs2E34[acc] = count & 0xFF
+                            acc += add
+                            if acc >= 0x80:
+                                break
+
+                else:
+                    bits_asc -= 8
+                    self.ch_bits_asc[pch_bits_asc_idx] = bits_asc
+
+                    add = (1 << bits_asc)
+                    acc = ch_code_asc[pch_code_asc_idx] >> 8
+
+                    while True:
+                        self.offs2EB4[acc] = count & 0xFF
+                        acc += add
+                        if acc >= 0x100:
+                            break
+
+            pch_code_asc_idx -= 1
+            count -= 1
+
+    # -----------------------------------------------------------------------------
+    #  Removes given number of bits in the bit buffer. New bits are reloaded from
+    #  the input buffer, if needed.
+    #  Returns: PKDCL_OK:         Operation was successful
+    #           PKDCL_STREAM_END: There are no more bits in the input buffer
+    def _waste_bits(self, n_bits):
+        #  If number of bits required is less than number of (bits in the buffer) ?
+        if n_bits <= self.extra_bits:
+            self.extra_bits -= n_bits
+            self.bit_buff >>= n_bits
+            return PKDCL_OK
+
+        #  Load input buffer if necessary
+        self.bit_buff >>= self.extra_bits
+        if self.in_pos == self.in_bytes:
+            return PKDCL_STREAM_END
+
+        #  Update bit buffer
+        self.in_pos += 1
+        self.bit_buff |= (self.in_buff[self.in_pos - 1] << 8)
+        self.bit_buff >>= (n_bits - self.extra_bits)
+        self.extra_bits = (self.extra_bits - n_bits) + 8
         return PKDCL_OK
 
-    #  Load input buffer if necessary
-    work.bit_buff >>= work.extra_bits
-    if work.in_pos == work.in_bytes:
-        work.in_pos = len(work.in_buff)
-        read_data = work.read_buf(work.in_pos)
-        work.in_bytes = len(read_data)
-        work.in_buff[:work.in_bytes] = read_data
-        if work.in_bytes == 0:
-            return PKDCL_STREAM_END
-        work.in_pos = 0
+    # -----------------------------------------------------------------------------
+    #  Decodes next literal from the input (compressed) data.
+    #  Returns : 0x000: One byte 0x00
+    #            0x001: One byte 0x01
+    #            ...
+    #            0x0FF: One byte 0xFF
+    #            0x100: Repetition, length of 0x02 bytes
+    #            0x101: Repetition, length of 0x03 bytes
+    #            ...
+    #            0x304: Repetition, length of 0x206 bytes
+    #            0x305: End of stream
+    #            0x306: Error
+    def _decode_lit(self):
+        #  Test the current bit in byte buffer. If is not set, simply return the next 8 bits.
+        if self.bit_buff & 1 != 0:
+            #  Remove one bit from the input data
+            if self._waste_bits(1):
+                return 0x306
 
-    #  Update bit buffer
-    work.in_pos += 1
-    work.bit_buff |= (work.in_buff[work.in_pos - 1] << 8)
-    work.bit_buff >>= (n_bits - work.extra_bits)
-    work.extra_bits = (work.extra_bits - n_bits) + 8
-    return PKDCL_OK
+            #  The next 8 bits hold the index to the length code table
+            length_code = self.length_codes[self.bit_buff & 0xFF]
 
+            #  Remove the apropriate number of bits
+            if self._waste_bits(self.len_bits[length_code]):
+                return 0x306
 
-# -----------------------------------------------------------------------------
-#  Decodes next literal from the input (compressed) data.
-#  Returns : 0x000: One byte 0x00
-#            0x001: One byte 0x01
-#            ...
-#            0x0FF: One byte 0xFF
-#            0x100: Repetition, length of 0x02 bytes
-#            0x101: Repetition, length of 0x03 bytes
-#            ...
-#            0x304: Repetition, length of 0x206 bytes
-#            0x305: End of stream
-#            0x306: Error
-def decode_lit(work):
-    #  Test the current bit in byte buffer. If is not set, simply return the next 8 bits.
-    if work.bit_buff & 1 != 0:
+            #  Are there some extra bits for the obtained length code ?
+            extra_length_bits = self.ex_len_bits[length_code]
+            if extra_length_bits != 0:
+                extra_length = self.bit_buff & ((1 << extra_length_bits) - 1)
+
+                if self._waste_bits(extra_length_bits):
+                    if (length_code + extra_length) != 0x10E:
+                        return 0x306
+                length_code = self.len_base[length_code] + extra_length
+
+            #  In order to distinguish uncompressed byte from repetition length,
+            #  we have to add 0x100 to the length.
+            return length_code + 0x100
+
         #  Remove one bit from the input data
-        if waste_bits(work, 1):
+        if self._waste_bits(1):
             return 0x306
 
-        #  The next 8 bits hold the index to the length code table
-        length_code = work.length_codes[work.bit_buff & 0xFF]
+        #  If the binary compression type, read 8 bits and return them as one byte.
+        if self.ctype == CMP_BINARY:
+            uncompressed_byte = self.bit_buff & 0xFF
 
-        #  Remove the apropriate number of bits
-        if waste_bits(work, work.len_bits[length_code]):
-            return 0x306
+            if self._waste_bits(8):
+                return 0x306
+            return uncompressed_byte
 
-        #  Are there some extra bits for the obtained length code ?
-        extra_length_bits = work.ex_len_bits[length_code]
-        if extra_length_bits != 0:
-            extra_length = work.bit_buff & ((1 << extra_length_bits) - 1)
+        #  When ASCII compression ...
+        if self.bit_buff & 0xFF:
+            value = self.offs2C34[self.bit_buff & 0xFF]
 
-            if waste_bits(work, extra_length_bits):
-                if (length_code + extra_length) != 0x10E:
-                    return 0x306
-            length_code = work.len_base[length_code] + extra_length
+            if value == 0xFF:
+                if self.bit_buff & 0x3F != 0:
+                    if self._waste_bits(4):
+                        return 0x306
 
-        #  In order to distinguish uncompressed byte from repetition length,
-        #  we have to add 0x100 to the length.
-        return length_code + 0x100
+                    value = self.offs2D34[self.bit_buff & 0xFF]
+                else:
+                    if self._waste_bits(6):
+                        return 0x306
 
-    #  Remove one bit from the input data
-    if waste_bits(work, 1):
-        return 0x306
-
-    #  If the binary compression type, read 8 bits and return them as one byte.
-    if work.ctype == CMP_BINARY:
-        uncompressed_byte = work.bit_buff & 0xFF
-
-        if waste_bits(work, 8):
-            return 0x306
-        return uncompressed_byte
-
-    #  When ASCII compression ...
-    if work.bit_buff & 0xFF:
-        value = work.offs2C34[work.bit_buff & 0xFF]
-
-        if value == 0xFF:
-            if work.bit_buff & 0x3F != 0:
-                if waste_bits(work, 4):
-                    return 0x306
-
-                value = work.offs2D34[work.bit_buff & 0xFF]
-            else:
-                if waste_bits(work, 6):
-                    return 0x306
-
-                value = work.offs2E34[work.bit_buff & 0x7F]
-    else:
-        if waste_bits(work, 8):
-            return 0x306
-
-        value = work.offs2EB4[work.bit_buff & 0xFF]
-
-    return 0x306 if waste_bits(work, work.ch_bits_asc[value]) else value
-
-
-# -----------------------------------------------------------------------------
-#  Decodes the distance of the repetition, backwards relative to the
-#  current output buffer position
-def decode_dist(work, rep_length):
-    #  Next 2-8 bits in the input buffer is the distance position code
-    dist_pos_code = work.dist_pos_codes[work.bit_buff & 0xFF]
-    dist_pos_bits = work.dist_bits[dist_pos_code]
-    if waste_bits(work, dist_pos_bits):
-        return 0
-
-    if rep_length == 2:
-        #  If the repetition is only 2 bytes length,
-        #  then take 2 bits from the stream in order to get the distance
-        distance = (dist_pos_code << 2) | (work.bit_buff & 0x03)
-        if waste_bits(work, 2):
-            return 0
-    else:
-        #  If the repetition is more than 2 bytes length,
-        #  then take "dsize_bits" bits in order to get the distance
-        distance = (dist_pos_code << work.dsize_bits) | (work.bit_buff & work.dsize_mask)
-        if waste_bits(work, work.dsize_bits):
-            return 0
-    return distance + 1
-
-
-def expand(work):
-    work.output_pos = 0x1000  # Initialize output buffer position
-
-    #  Decode the next literal from the input data.
-    #  The returned literal can either be an uncompressed byte (next_literal < 0x100)
-    #  or an encoded length of the repeating byte sequence that
-    #  is to be copied to the current buffer position
-    result = next_literal = decode_lit(work)
-
-    while result < 0x305:
-        #  If the literal is greater than 0x100, it holds length
-        #  of repeating byte sequence
-        #  literal of 0x100 means repeating sequence of 0x2 bytes
-        #  literal of 0x101 means repeating sequence of 0x3 bytes
-        #  ...
-        #  literal of 0x305 means repeating sequence of 0x207 bytes
-        if next_literal >= 0x100:
-            #  Get the length of the repeating sequence.
-            #  Note that the repeating block may overlap the current output position,
-            #  for example if there was a sequence of equal bytes
-            rep_length = next_literal - 0xFE
-
-            #  Get backward distance to the repetition
-            minus_dist = decode_dist(work, rep_length)
-            if minus_dist == 0:
-                result = 0x306
-                break
-
-            #  Target and source pointer
-            target_offset = work.output_pos
-            source_offset = work.output_pos - minus_dist
-
-            #  Copy the repeating sequence
-            work.out_buff[target_offset:target_offset + rep_length] = \
-                work.out_buff[source_offset:source_offset + rep_length]
-
-            #  Update buffer output position
-            work.output_pos += rep_length
-
+                    value = self.offs2E34[self.bit_buff & 0x7F]
         else:
-            work.output_pos += 1
-            work.out_buff[work.output_pos - 1] = next_literal & 0xFF
+            if self._waste_bits(8):
+                return 0x306
 
-        #  Flush the output buffer, if number of extracted bytes has reached the end
-        if work.output_pos >= 0x2000:
-            #  Copy decompressed data into user buffer
-            copy_bytes = 0x1000
-            work.write_buf(work.out_buff[0x1000:0x1000 + copy_bytes])
+            value = self.offs2EB4[self.bit_buff & 0xFF]
 
-            #  Now copy the decompressed data to the first half of the buffer.
-            #  This is needed because the decompression might reuse them as repetitions.
-            #  Note that if the output buffer overflowed previously, the extra decompressed bytes
-            #  are stored in "out_buff_overflow", and they will now be
-            #  within decompressed part of the output buffer.
-            target_offset = 0
-            source_offset = 0x1000
-            copy_length = work.output_pos - 0x1000
+        return 0x306 if self._waste_bits(self.ch_bits_asc[value]) else value
 
-            work.out_buff[target_offset:target_offset + copy_length] = \
-                work.out_buff[source_offset:source_offset + copy_length]
+    # -----------------------------------------------------------------------------
+    #  Decodes the distance of the repetition, backwards relative to the
+    #  current output buffer position
+    def _decode_dist(self, rep_length):
+        #  Next 2-8 bits in the input buffer is the distance position code
+        dist_pos_code = self.dist_pos_codes[self.bit_buff & 0xFF]
+        dist_pos_bits = self.dist_bits[dist_pos_code]
+        if self._waste_bits(dist_pos_bits):
+            return 0
 
-            work.output_pos -= 0x1000
-
-        result = next_literal = decode_lit(work)
-
-    #  Flush any remaining decompressed bytes
-    copy_bytes = work.output_pos - 0x1000
-    work.write_buf(work.out_buff[0x1000:0x1000 + copy_bytes])
-    return result
+        if rep_length == 2:
+            #  If the repetition is only 2 bytes length,
+            #  then take 2 bits from the stream in order to get the distance
+            distance = (dist_pos_code << 2) | (self.bit_buff & 0x03)
+            if self._waste_bits(2):
+                return 0
+        else:
+            #  If the repetition is more than 2 bytes length,
+            #  then take "dsize_bits" bits in order to get the distance
+            distance = (dist_pos_code << self.dsize_bits) | (self.bit_buff & self.dsize_mask)
+            if self._waste_bits(self.dsize_bits):
+                return 0
+        return distance + 1
 
 
 # -----------------------------------------------------------------------------
 #  Main exploding function.
 def explode(input_buffer):
-    work = TDcmpStruct(input_buffer)
-
-    #  Initialize work struct and load compressed data
-    #  Note: The caller must zero the "work_buff" before passing it to explode
-    work.in_pos = len(work.in_buff)
-    read_data = work.read_buf(work.in_pos)
-    work.in_bytes = len(read_data)
-    work.in_buff[:work.in_bytes] = read_data
-    if work.in_bytes <= 4:
-        raise Exception("CMP_BAD_DATA")
-
-    work.ctype = work.in_buff[0]  # Get the compression type (CMP_BINARY or CMP_ASCII)
-    work.dsize_bits = work.in_buff[1]  # Get the dictionary size
-    work.bit_buff = work.in_buff[2]  # Initialize 16-bit bit buffer
-    work.extra_bits = 0  # Extra (over 8) bits
-    work.in_pos = 3  # Position in input buffer
-
-    #  Test for the valid dictionary size
-    if 4 > work.dsize_bits or work.dsize_bits > 6:
-        raise Exception("CMP_INVALID_DICTSIZE")
-
-    work.dsize_mask = 0xFFFF >> (0x10 - work.dsize_bits)  # Shifted by 'sar' instruction
-
-    if work.ctype != CMP_BINARY:
-        if work.ctype != CMP_ASCII:
-            raise Exception("CMP_INVALID_MODE")
-
-        work.ch_bits_asc[:len(work.ch_bits_asc)] = ch_bits_asc
-        gen_asc_tabs(work)
-
-    work.len_bits[:len(work.len_bits)] = len_bits
-    gen_decode_tabs(work.length_codes, len_code, work.len_bits, )
-    work.ex_len_bits[:len(work.ex_len_bits)] = ex_len_bits
-    work.len_base[:len(work.len_base)] = len_base
-    work.dist_bits[:len(work.dist_bits)] = dist_bits
-    gen_decode_tabs(work.dist_pos_codes, dist_code, work.dist_bits)
-    if expand(work) != 0x306:
-        return work.decompressed
-
-    raise Exception("CMP_ABORT")
+    return PkDecompressor(input_buffer).expand()
